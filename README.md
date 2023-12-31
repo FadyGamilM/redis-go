@@ -259,3 +259,131 @@ log.Printf("username is : %v\n", res)
 2023/12/30 09:31:58 user:102 doesn't exists
 2023/12/30 09:31:58 error getting username : redis: nil
 ```
+
+# (Design Decisions) How to decide which resource from your application should be stored in redis as a hash ?
+
+### Reasons to store resource as hash :
+- When we need to access a singlre record in many different scenarios 
+    ```text
+    For example, if we are building an e-commerce app, we will have an item page, and in this page we might need to render many info from multiple tables, so we will perform multiple queries and joins to our database.
+    and actually what we should do is to come with a solution that make us perform the smallest number of queries as possible.
+    ```
+
+- If we need to fetch some collection (array) of records from a table and we need to sort this collection in the view in many different ways
+    ```text
+    For example, in our e-commerce, we might need to render all the items of the user in his dashboard in form of a table, and we provide a feature for the user to sort these items by selecting any field, so we can sort by name, price, views, buys, or expiration date.
+    ```
+
+- If we need to access a single record from this resource table at a time.
+
+### Reasons to `not` store resource as hash :
+- If the resource is all about counting some action, or enforcing uniqueness of some action.
+    ```text
+    For example, we might have a view feature on some item and we need to enforce that a single user can only view an item once. and if the user visits the item page multiple times later, the views will not be increased.
+    ```
+
+- If your resource represents a time-series type of data 
+    ```text
+    For example, if our data are shown into a graph in the user dashboard, don't store this resource in a redis hash
+    ```
+
+### How Redis deals with Dates ..
+If you need to store a Date/Time data type, its better to convert it to unix format (in seconds or milliseconds) so redis can convert them to string and can easily sort based on them if you want, and in the `deserialize` method in you core logic, you can covert the unix to whatever the format you want.
+
+### How to fine-tune your performence ?
+If you want to execute a query to retreive orders with these keys ["Order:1", "Order:12", "Order:20", "Order:5"]
+- one option is to execute 4 queries to redis, one for each order. (BAD)
+- another option is to pipeline the queries and send them as one shot to redis server and redis will process them sequentially. 
+
+# Set data type in Redis
+Sets are used to store unique values, and if you try to add a value that is already existing, redis will return 0 for you and nothing will change.
+```powershell
+127.0.0.1:6379> SADD genders male
+(integer) 1
+127.0.0.1:6379> SADD genders male
+(integer) 0
+127.0.0.1:6379> SADD genders female
+(integer) 1
+127.0.0.1:6379> SMEMBERS genders
+1) "male"
+2) "female"
+```
+
+Unions returns to you all the unique values from all existing sets 
+```powershell 
+127.0.0.1:6379> SADD levels:1 junior senior mid-level
+(integer) 3
+127.0.0.1:6379> SADD levels:2 tech-lead mid-level
+(integer) 2
+127.0.0.1:6379> SUNION levels:1 levels:2
+1) "junior"
+2) "senior"
+3) "mid-level"
+4) "tech-lead"
+127.0.0.1:6379>
+```
+
+to get the common values between all sets, use intersect command 
+```powershell
+127.0.0.1:6379> SINTER levels:1 levels:2
+1) "mid-level" 
+```
+
+to check if a value exists in the SET or not without fetching all set items from redis (because if the SET contains thousands of values, it will be O(n) which is costly ) . we can use the `SISMEMBER`
+```powershell
+127.0.0.1:6379> SADD levels:1 tech-lead junior senior
+(integer) 3
+127.0.0.1:6379> SADD levels:2 product-manager
+(integer) 1
+127.0.0.1:6379> SISMEMBER levels:1 junior
+(integer) 1
+127.0.0.1:6379> SISMEMBER levels:1 product-manager
+(integer) 0
+127.0.0.1:6379>
+```
+
+to get the total number of values from a SET 
+```powershell
+127.0.0.1:6379> SISMEMBER levels:1 junior
+(integer) 1
+127.0.0.1:6379> SISMEMBER levels:1 product-manager
+(integer) 0
+127.0.0.1:6379> SCARD levels:1
+(integer) 3
+```
+
+## Use cases of SET data type in Redis ?
+### 1. To enforce that a field must have unique values only 
+- store set with key = username and this set will contains all usernames in our application registered before
+- then for each new username, we don't have to go to database to check if its unique or not, we can do this with our Redis instance using the `SISMEMBER` command
+
+### 2. To perform Join queries or to gather some data related to each others from different tables with fast queries  
+- Query (1) : Find how many orders this user with id = 520 has ordered 
+    ```text
+    we store the SET ( users:520:orders, [ids of orders] )
+    then we retrieve the number of orders using the SCARD command 
+    ```
+    ```powershell
+    127.0.0.1:6379> SADD users:520:orders 120 152 180 12 3
+    (integer) 5
+    127.0.0.1:6379> SCARD users:520:orders
+    (integer) 5
+    127.0.0.1:6379>
+    ```
+- Query (2) : Find all orders this user has ordered 
+    ```text
+    we store the SET ( users:520:orders, [ids of orders] )
+    then we retreive all ids of orders at once using the SMEMBERS command 
+    then either retreive them at once using pipeline pattern if the orders are stored in redis / all retreive them from database but at once, we don't have to perform joins 
+    ```
+
+- Query (3) : Find all orders that user with id = 1 and user with id = 3 ordered 
+    ```text
+    we create a SET with key = users:1:orders and another SET with key = users:3:orders and we perform SINTER between these 2 SETs to find the common values
+    ```
+
+    Example: Lets build the Like feature (first click means like, next click means unlike and so on ... )
+    - we create the SET where the key = users:[user_id]:likes and the values are the ids of the items that this user liked
+    - in like-handler we receive the id of the item and id of the user, we find the user:[id]:likes set and add this item to it 
+    - same for the unlike-handler but we will remove the id from the set
+    ![alt](likes-feature.png)
